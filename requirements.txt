@@ -1,5 +1,5 @@
-flask
-python-telegram-bot==13.15
+pyTelegramBotAPI
+google-genai
 requests
-google-generativeai
-pandas
+flask
+gunicorn
