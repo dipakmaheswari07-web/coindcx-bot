@@ -1,92 +1,129 @@
 import os
+import time
 import hmac
 import hashlib
+import json
+import threading
 import requests
-from flask import Flask, jsonify
-from google import genai
+import google.generativeai as genai
+from flask import Flask
 
 app = Flask(__name__)
 
-# ==================== CONFIGURATION ====================
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# एनवायरनमेंट वेरिएबल्स से सभी क्रेडेंशियल्स लोड करें
 COINDCX_API_KEY = os.getenv("COINDCX_API_KEY")
-COINDCX_SECRET_KEY = os.getenv("COINDCX_SECRET_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_ID = os.getenv("TELEGRAM_ID")
+COINDCX_API_SECRET = os.getenv("COINDCX_API_SECRET")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# True = पेपर ट्रेडिंग, False = रियल मनी लाइव ट्रेडिंग
+# टेलीग्राम क्रेडेंशियल्स
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# पेपर ट्रेडिंग मोड ('True' यानी पेपर ट्रेडिंग, 'False' यानी रियल ट्रेडिंग)
 PAPER_TRADING = os.getenv("PAPER_TRADING", "True").lower() == "true"
 
-# Gemini क्लाइंट इनिशियलाइज करें
-client = genai.Client(api_key=GEMINI_API_KEY)
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-pro')
 
-# सिस्टम प्रॉम्प्ट जिसमें स्पष्ट निर्देश है कि फुल डे का स्टॉप लॉस 20% है
-GEMINI_SYSTEM_INSTRUCTION = (
-    "आप एक क्रिप्टो ट्रेडिंग असिस्टेंट हैं। आपके लिए सख्त नियम है: "
-    "फुल डे का स्टॉप लॉस 20% है। किसी भी ट्रेड का सुझाव देते समय या विश्लेषण करते समय "
-    "इस 20% डेली स्टॉप-लॉस सीमा का कड़ाई से पालन करें। यदि नुकसान 20% तक पहुँच जाए, तो ट्रेडिंग बंद कर दें।"
-)
+BASE_URL = "https://api.coindcx.com"
 
-# ==================== HELPER FUNCTIONS ====================
-
-def send_telegram_message(message: str):
-    """टेलीग्राम पर मैसेज भेजने के लिए फंक्शन"""
-    if not TELEGRAM_TOKEN or not TELEGRAM_ID:
+def send_telegram_message(message):
+    """टेलीग्राम पर अलर्ट भेजने के लिए फंक्शन"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram tokens not provided. Skipping alert.")
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
     try:
-        requests.post(url, json={"chat_id": TELEGRAM_ID, "text": message})
+        requests.post(url, json=payload)
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print(f"Failed to send Telegram alert: {e}")
 
-def get_coindcx_signature(secret_string: str) -> str:
-    """CoinDCX API के लिए HMAC SHA256 सिग्नेचर जनरेट करना"""
-    secret_bytes = bytes(COINDCX_SECRET_KEY, encoding='utf-8')
-    signature = hmac.new(secret_bytes, secret_string.encode('utf-8'), hashlib.sha256).hexdigest()
-    return signature
+def generate_signature(secret, body):
+    return hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
 
-# ==================== WEB SERVER ROUTES ====================
+def get_market_data():
+    url = "https://public.coindcx.com/market_data/ticker"
+    response = requests.get(url)
+    return response.json()
 
-@app.route("/")
-def home():
-    mode_name = "🟢 PAPER TRADING (वर्चुअल)" if PAPER_TRADING else "🔴 LIVE TRADING (रियल मनी)"
-    return jsonify({
-        "status": "Web Server is Running",
-        "trading_mode": mode_name,
-        "full_day_stop_loss": "20%"
-    })
-
-@app.route("/check-and-trade", methods=["GET", "POST"])
-def check_and_trade():
-    """यह एंडपॉइंट मार्केट चेक करेगा और Gemini की सलाह लेगा"""
-    mode_str = "PAPER TRADING" if PAPER_TRADING else "LIVE TRADING (REAL MONEY)"
-    
-    try:
-        # Gemini से विश्लेषण प्राप्त करना
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=f"{GEMINI_SYSTEM_INSTRUCTION}\n\nCurrent Mode: {mode_str}. कॉइन डीसीएक्स फ्यूचर्स INR वॉलेट के लिए मार्केट डेटा का विश्लेषण करें। फुल डे का स्टॉप लॉस 20% का ध्यान रखते हुए क्या ट्रेड लेना सुरक्षित है?"
-        )
-        ai_advice = response.text
-    except Exception as e:
-        ai_advice = f"Gemini Error: {e}"
-
-    # मोड के आधार पर एक्शन
+def place_futures_order(pair, side, quantity, leverage):
     if PAPER_TRADING:
-        log_msg = f"🧪 [Paper Trading Check]\nGemini: {ai_advice}"
-    else:
-        log_msg = f"⚠️ [LIVE REAL MONEY TRADING CHECK]\nGemini: {ai_advice}"
-        # यहाँ CoinDCX फ्यूचर्स लाइव आर्डर प्लेसमेंट का कोड जोड़ा जाएगा
+        msg = f"📝 *[PAPER TRADING]* Order Simulated:\nPair: {pair}\nSide: {side}\nQuantity: {quantity}\nLeverage: {leverage}x"
+        print(msg)
+        send_telegram_message(msg)
+        return {"status": "simulated"}
 
-    send_telegram_message(log_msg)
+    path = "/exchange/v1/derivatives/futures/orders/create"
+    url = BASE_URL + path
+    body = {
+        "side": side,
+        "pair": pair,
+        "total_quantity": quantity,
+        "order_type": "market",
+        "leverage": leverage,
+        "timestamp": int(time.time() * 1000)
+    }
+    json_body = json.dumps(body)
+    signature = generate_signature(COINDCX_API_SECRET, json_body)
+    headers = {
+        "Content-Type": "application/json",
+        "X-AUTH-APIKEY": COINDCX_API_KEY,
+        "X-AUTH-SIGNATURE": signature
+    }
+    response = requests.post(url, data=json_body, headers=headers)
+    result = response.json()
     
-    return jsonify({
-        "status": "Success",
-        "mode": mode_str,
-        "gemini_advice": ai_advice
-    })
+    send_telegram_message(f"🚨 *[REAL TRADING]* Order Executed!\nResponse: `{result}`")
+    return result
+
+def trading_loop():
+    mode_text = "PAPER TRADING (Simulated)" if PAPER_TRADING else "REAL MONEY TRADING"
+    start_msg = f"🤖 Gemini CoinDCX Web Bot Started!\nMode: *{mode_text}*"
+    print(start_msg)
+    send_telegram_message(start_msg)
+
+    while True:
+        try:
+            tickers = get_market_data()
+            btc_data = next((item for item in tickers if item['market'] == 'B-BTC_USDT'), None)
+            
+            prompt = f"Current market data for BTC: {btc_data}. Analyze market trends and give a short trading decision: BUY, SELL, or HOLD for futures."
+            response = model.generate_content(prompt)
+            decision = response.text.strip().upper()
+            
+            print(f"Gemini Decision: {decision}")
+            
+            if "BUY" in decision:
+                place_futures_order('B-BTC_USDT', 'buy', 0.001, 2)
+            elif "SELL" in decision:
+                place_futures_order('B-BTC_USDT', 'sell', 0.001, 2)
+            else:
+                print("Holding position. No trade executed.")
+                
+        except Exception as e:
+            err_msg = f"❌ Error in trading loop: {e}"
+            print(err_msg)
+            send_telegram_message(err_msg)
+            
+        time.sleep(300) # हर 5 मिनट में लूप चलेगा
+
+# फ्लस्क रूट (वेब सर्वर चेक करने के लिए)
+@app.route('/')
+def home():
+    mode = "Paper Trading" if PAPER_TRADING else "Real Trading"
+    return f"Gemini CoinDCX Bot is running! Mode: {mode}"
 
 if __name__ == "__main__":
-    # Render द्वारा दिए गए PORT पर सर्वर शुरू करें
+    # ट्रेडिंग लूप को बैकग्राउंड थ्रेड में शुरू करें ताकि वेब सर्वर भी साथ में चल सके
+    t = threading.Thread(target=trading_loop)
+    t.daemon = True
+    t.start()
+
+    # रेंडर द्वारा दिए गए पोर्ट पर फ्लस्क सर्वर चलाएं
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host='0.0.0.0', port=port)
