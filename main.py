@@ -5,25 +5,26 @@ import google.generativeai as genai
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 
-# Environment Variables
+# पर्यावरण चर (Environment Variables)
 COINDCX_API_KEY = os.environ.get("COINDCX_API_KEY")
 COINDCX_API_SECRET = os.environ.get("COINDCX_API_SECRET")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+PAPER_TRADING = os.environ.get("PAPER_TRADING", "True").lower() == "true"
 
-# Setup Gemini AI with Gemini 3.8 Flash
+# जेमिनी 3.8 फ्लैश मॉडल सेटअप
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel("gemini-3.8-flash")
 
-# Simple HTTP Server for Render Health Check
+# रेंडर हेल्थ चेक के लिए इन-बिल्ट एचटीटीपी सर्वर
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
         self.end_headers()
-        self.wfile.write(b"Gemini Dynamic Trading Bot with 20% Stop-Loss is Running!")
+        self.wfile.write(b"Gemini Crypto Futures Trading Bot is Live and Running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -34,11 +35,8 @@ def run_web_server():
     port = int(os.environ.get("PORT", 10000))
     server_address = ('', port)
     httpd = HTTPServer(server_address, HealthCheckHandler)
-    print(f"Web server running on port {port}")
+    print(f"वेब सर्वर पोर्ट {port} पर चल रहा है")
     httpd.serve_forever()
-
-# Trading Logic Rules
-DAILY_STOP_LOSS_PCT = 20.0
 
 def send_telegram(msg):
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
@@ -46,29 +44,58 @@ def send_telegram(msg):
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
             requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
         except Exception as e:
-            print(f"Telegram error: {e}")
+            print(f"टेलीग्राम त्रुटि: {e}")
+
+def fetch_coindcx_market_data():
+    """कॉइनडीसीएक्स पब्लिक एपीआई से लाइव मार्केट डेटा फेच करना"""
+    try:
+        url = "https://public.coindcx.com/market_data/ticker"
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            # फ्यूचर्स या मुख्य कॉइन्स के डेटा को फ़िल्टर करना
+            filtered_data = [item for item in data if item.get('market', '').endswith('USDT')][:30]
+            return str(filtered_data)
+    except Exception as e:
+        print(f"मार्केट डेटा फेच करने में त्रुटि: {e}")
+    return "Market data unavailable"
 
 def analyze_and_trade():
+    # सिस्टम प्रम्प्ट जिसमें केवल 20% स्टॉप-लॉस का मुख्य नियम है
     system_prompt = """
-    You are an autonomous top-tier Crypto Futures Trader with access to all crypto futures pairs.
-    Rules:
-    1. Maximum daily stop loss is 20%. Protect capital at all costs.
-    2. ALWAYS prioritize the lowest possible leverage (1x to 3x) for all setups.
-    3. Use high leverage (up to 100x) ONLY as a fallback when an exceptional high-conviction trade cannot meet minimum order requirements with low leverage due to limited margin.
-    4. You have full authority to BUY, SELL, or HOLD on any crypto futures coin.
+    You are an autonomous Crypto Futures Trader. 
+    Strict Rule: Your maximum daily stop-loss is strictly 20%. Capital protection is mandatory.
+    Other than this single rule, you have full authority and intelligence to analyze the provided live market data, select coins, choose optimal leverage, manage risk, and execute trades for maximum profit.
     """
-    print("AI scanning all crypto futures with dynamic leverage & 20% stop-loss rules...")
+    
+    print("कॉइनडीसीएक्स से लाइव डेटा फेच किया जा रहा है और एआई विश्लेषण कर रहा है...")
+    market_data = fetch_coindcx_market_data()
+    
+    prompt_input = f"{system_prompt}\n\nLive Market Data:\n{market_data}\n\nAnalyze the data and provide your optimal trading decisions."
+    
+    try:
+        response = model.generate_content(prompt_input)
+        ai_decision = response.text
+        print(f"AI Decision: {ai_decision}")
+        
+        if PAPER_TRADING:
+            send_telegram(f"🤖 **पेपर ट्रेडिंग लाइव अपडेट**\n\n{ai_decision}")
+        else:
+            send_telegram(f"🚀 **लाइव ट्रेड सिग्नल**\n\n{ai_decision}")
+            
+    except Exception as e:
+        print(f"एआई विश्लेषण त्रुटि: {e}")
 
 if __name__ == "__main__":
-    # Web server in background thread
+    # बैकग्राउंड थ्रेड में वेब सर्वर चलाना ताकि रेंडर एक्टिव रहे
     web_thread = threading.Thread(target=run_web_server)
     web_thread.daemon = True
     web_thread.start()
 
-    # Main Trading Loop
+    # मुख्य ट्रेडिंग लूप (हर 5 मिनट में रन होगा)
     while True:
         try:
             analyze_and_trade()
         except Exception as e:
-            print(f"Execution Error: {e}")
+            print(f"एक्जीक्यूशन त्रुटि: {e}")
         time.sleep(300)
