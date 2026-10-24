@@ -6,6 +6,21 @@ import requests
 import ccxt
 from google import genai
 from datetime import datetime, timezone
+from threading import Thread
+from flask import Flask
+
+# ==========================================
+# 0. Render पोर्ट बाइंडिंग के लिए वेब सर्वर
+# ==========================================
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "🚀 Crypto AI Trading Bot is Running Live!"
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
 
 # ==========================================
 # 1. पर्यावरण वेरिएबल्स (Environment Variables)
@@ -16,7 +31,6 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# ⚠️ सावधान: लाइव रियल मनी ट्रेडिंग के लिए इसे False करें
 PAPER_TRADING = os.getenv("PAPER_TRADING", "False").lower() == "true"
 DAILY_MAX_LOSS_PERCENT = 0.20  # 20% दैनिक स्टॉप-लॉस
 
@@ -31,22 +45,21 @@ if not COINDCX_API_KEY or not COINDCX_SECRET_KEY:
 # ==========================================
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-exchange = ccxt.coindcx({
+exchange = ccxt['coindcx']({
     'apiKey': COINDCX_API_KEY,
     'secret': COINDCX_SECRET_KEY,
     'enableRateLimit': True,
     'options': {
-        'defaultType': 'future',  # फ्यूचर्स ट्रेडिंग के लिए
+        'defaultType': 'future',
     }
 })
 
-# दैनिक P&L और स्टॉप-लॉस ट्रैकिंग वेरिएबल्स
 day_start_balance = None
 last_reset_day = None
 stop_loss_hit_today = False
 
 # ==========================================
-# 3. टेलीग्राम नोटिफिकेशन सिस्टम (All-Inclusive)
+# 3. टेलीग्राम नोटिफिकेशन सिस्टम
 # ==========================================
 def send_telegram_alert(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -157,7 +170,7 @@ def fetch_market_and_position_data(symbol='BTC/USDT'):
         return None
 
 # ==========================================
-# 7. जेमिनी एआई से डिसीजन प्राप्त करना (Robust JSON Parsing)
+# 7. जेमिनी एआई से डिसीजन प्राप्त करना
 # ==========================================
 def get_ai_decision(market_data, current_balance):
     prompt_payload = {
@@ -194,7 +207,7 @@ def get_ai_decision(market_data, current_balance):
     return None
 
 # ==========================================
-# 8. ट्रेड निष्पादन (Execution & Safety Checks)
+# 8. ट्रेड निष्पादन
 # ==========================================
 def execute_trade(decision):
     if not decision or not isinstance(decision, dict):
@@ -253,7 +266,7 @@ def execute_trade(decision):
         log_and_alert(f"❌ **Live Order Execution Error:** {str(e)}")
 
 # ==========================================
-# 9. 5-मिनट कैंडल सिंक्रोनाइजेशन के साथ मुख्य लूप
+# 9. मुख्य लूप (5-मिनट सिंक्रोनाइजेशन)
 # ==========================================
 def wait_for_next_5m_candle():
     now = datetime.now(timezone.utc)
@@ -292,4 +305,8 @@ def main():
         wait_for_next_5m_candle()
 
 if __name__ == "__main__":
-    main()
+    bot_thread = Thread(target=main)
+    bot_thread.daemon = True
+    bot_thread.start()
+
+    run_web_server()
