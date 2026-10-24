@@ -1,7 +1,7 @@
 import os
 import time
 import requests
-import google.generativeai as genai
+from google import genai
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 
@@ -13,10 +13,10 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 PAPER_TRADING = os.environ.get("PAPER_TRADING", "True").lower() == "true"
 
-# जेमिनी 3.8 फ्लैश मॉडल सेटअप
+# नए google.genai पैकेज का उपयोग करके क्लाइंट सेटअप
+client = None
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-3.8-flash")
+    client = genai.Client(api_key=GEMINI_API_KEY)
 
 # रेंडर हेल्थ चेक के लिए इन-बिल्ट एचटीटीपी सर्वर
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -53,7 +53,6 @@ def fetch_coindcx_market_data():
         response = requests.get(url, timeout=10)
         if response.status_code == 200:
             data = response.json()
-            # फ्यूचर्स या मुख्य कॉइन्स के डेटा को फ़िल्टर करना
             filtered_data = [item for item in data if item.get('market', '').endswith('USDT')][:30]
             return str(filtered_data)
     except Exception as e:
@@ -61,7 +60,6 @@ def fetch_coindcx_market_data():
     return "Market data unavailable"
 
 def analyze_and_trade():
-    # सिस्टम प्रम्प्ट जिसमें केवल 20% स्टॉप-लॉस का मुख्य नियम है
     system_prompt = """
     You are an autonomous Crypto Futures Trader. 
     Strict Rule: Your maximum daily stop-loss is strictly 20%. Capital protection is mandatory.
@@ -74,25 +72,29 @@ def analyze_and_trade():
     prompt_input = f"{system_prompt}\n\nLive Market Data:\n{market_data}\n\nAnalyze the data and provide your optimal trading decisions."
     
     try:
-        response = model.generate_content(prompt_input)
-        ai_decision = response.text
-        print(f"AI Decision: {ai_decision}")
-        
-        if PAPER_TRADING:
-            send_telegram(f"🤖 **पेपर ट्रेडिंग लाइव अपडेट**\n\n{ai_decision}")
+        if client:
+            response = client.models.generate_content(
+                model='gemini-3.8-flash',
+                contents=prompt_input
+            )
+            ai_decision = response.text
+            print(f"AI Decision: {ai_decision}")
+            
+            if PAPER_TRADING:
+                send_telegram(f"🤖 **पेपर ट्रेडिंग लाइव अपडेट**\n\n{ai_decision}")
+            else:
+                send_telegram(f"🚀 **लाइव ट्रेड सिग्नल**\n\n{ai_decision}")
         else:
-            send_telegram(f"🚀 **लाइव ट्रेड सिग्नल**\n\n{ai_decision}")
+            print("Gemini API Key missing.")
             
     except Exception as e:
         print(f"एआई विश्लेषण त्रुटि: {e}")
 
 if __name__ == "__main__":
-    # बैकग्राउंड थ्रेड में वेब सर्वर चलाना ताकि रेंडर एक्टिव रहे
     web_thread = threading.Thread(target=run_web_server)
     web_thread.daemon = True
     web_thread.start()
 
-    # मुख्य ट्रेडिंग लूप (हर 5 मिनट में रन होगा)
     while True:
         try:
             analyze_and_trade()
