@@ -1,3 +1,4 @@
 ccxt
 google-genai
+flask
 requests
