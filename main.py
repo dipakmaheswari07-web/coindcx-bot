@@ -31,7 +31,6 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# ⚠️ रियल मनी मोड के लिए इसे False रखा गया है
 PAPER_TRADING = os.getenv("PAPER_TRADING", "False").lower() == "true"
 DAILY_MAX_LOSS_PERCENT = 0.20  # 20% दैनिक स्टॉप-लॉस
 
@@ -42,11 +41,16 @@ if not COINDCX_API_KEY or not COINDCX_SECRET_KEY:
     raise ValueError("CoinDCX API Keys are missing!")
 
 # ==========================================
-# 2. क्लाइंट और एक्सचेंज सेटअप (CoinDCX Futures)
+# 2. क्लाइंट और एक्सचेंज सेटअप (Safe Initialization)
 # ==========================================
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-exchange = ccxt.coindcx({
+# सुरक्षा जांच: ताकि पता चल सके कि लोकल फाइल का विवाद तो नहीं है
+if not hasattr(ccxt, 'coindcx'):
+    raise ImportError("❌ त्रुटि: CCXT लाइब्रेरी में 'coindcx' नहीं मिल रहा है। कृपया जांचें कि आपके प्रोजेक्ट फोल्डर में 'ccxt.py' नाम की कोई लोकल फाइल या फोल्डर तो नहीं है, यदि है तो उसे डिलीट करें!")
+
+exchange_class = ccxt.coindcx
+exchange = exchange_class({
     'apiKey': COINDCX_API_KEY,
     'secret': COINDCX_SECRET_KEY,
     'enableRateLimit': True,
@@ -78,7 +82,7 @@ def log_and_alert(message):
     send_telegram_alert(message)
 
 # ==========================================
-# 4. जेमिनी एआई का सिस्टम इंस्ट्रक्शन (3 मुख्य नियम)
+# 4. जेमिनी एआई का सिस्टम इंस्ट्रक्शन
 # ==========================================
 GEMINI_SYSTEM_INSTRUCTION = """
 नियम: 
