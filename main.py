@@ -1,317 +1,143 @@
 import os
 import time
+import hmac
+import hashlib
 import json
-import re
 import requests
-import ccxt
-from google import genai
-from datetime import datetime, timezone
-from threading import Thread
-from flask import Flask
+import google.generativeai as genai
 
-# ==========================================
-# 0. Render पोर्ट बाइंडिंग के लिए वेब सर्वर
-# ==========================================
-app = Flask(__name__)
+# Environment Variables Setup
+API_KEY = os.getenv('COINDCX_API_KEY')
+API_SECRET = os.getenv('COINDCX_API_SECRET')
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
-@app.route('/')
-def home():
-    return "🚀 Live Crypto AI Trading Bot is Running!"
+# Paper Trading Switch: true = Demo, false = Real Money Live Trading
+PAPER_TRADING = os.getenv('PAPER_TRADING', 'true').lower() == 'true'
 
-def run_web_server():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+BASE_URL = "https://api.coindcx.com"
 
-# ==========================================
-# 1. पर्यावरण वेरिएबल्स (Environment Variables)
-# ==========================================
-COINDCX_API_KEY = os.getenv("COINDCX_API_KEY")
-COINDCX_SECRET_KEY = os.getenv("COINDCX_SECRET_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# Gemini AI Configuration (Using Free Flash Model)
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel(
+    model_name='gemini-2.0-flash',
+    generation_config={"response_mime_type": "application/json"}
+)
 
-PAPER_TRADING = os.getenv("PAPER_TRADING", "False").lower() == "true"
-DAILY_MAX_LOSS_PERCENT = 0.20  # 20% दैनिक स्टॉप-लॉस
-
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY environment variable is missing!")
-
-if not COINDCX_API_KEY or not COINDCX_SECRET_KEY:
-    raise ValueError("CoinDCX API Keys are missing!")
-
-# ==========================================
-# 2. क्लाइंट और एक्सचेंज सेटअप (Safe Initialization)
-# ==========================================
-client = genai.Client(api_key=GEMINI_API_KEY)
-
-# सुरक्षा जांच: ताकि पता चल सके कि लोकल फाइल का विवाद तो नहीं है
-if not hasattr(ccxt, 'coindcx'):
-    raise ImportError("❌ त्रुटि: CCXT लाइब्रेरी में 'coindcx' नहीं मिल रहा है। कृपया जांचें कि आपके प्रोजेक्ट फोल्डर में 'ccxt.py' नाम की कोई लोकल फाइल या फोल्डर तो नहीं है, यदि है तो उसे डिलीट करें!")
-
-exchange_class = ccxt.coindcx
-exchange = exchange_class({
-    'apiKey': COINDCX_API_KEY,
-    'secret': COINDCX_SECRET_KEY,
-    'enableRateLimit': True,
-    'options': {
-        'defaultType': 'future',
-    }
-})
-
-day_start_balance = None
-last_reset_day = None
-stop_loss_hit_today = False
-
-# ==========================================
-# 3. टेलीग्राम नोटिफिकेशन सिस्टम
-# ==========================================
-def send_telegram_alert(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"Telegram Alert (Console Only): {message}")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"Telegram Dispatch Error: {e}")
-
-def log_and_alert(message):
-    print(message)
-    send_telegram_alert(message)
-
-# ==========================================
-# 4. जेमिनी एआई का सिस्टम इंस्ट्रक्शन
-# ==========================================
-GEMINI_SYSTEM_INSTRUCTION = """
-नियम: 
-1. फुल डे का स्टॉप-लॉस 20% है। यदि दिन की शुरुआत के बैलेंस से 20% नुकसान हो जाए, तो ट्रेडिंग बंद कर देनी है।
-2. लेवरेज का चयन: हमेशा कम से कम (लो से लो, जैसे 1x) लेवरेज रखने की कोशिश करें, लेकिन जरूरत पड़ने पर अधिकतम लेवरेज ले सकते हैं।
-3. ओपन पोजीशन अवेयरनेस: आपके पास पोर्टफोलियो का बैलेंस, 5-मिनट की कैंडलें और वर्तमान ओपन पोजीशन का डेटा होगा। यदि कोई पोजीशन पहले से लाइव है और टारगेट की दिशा में सही चल रही है, तो उसे अनावश्यक रूप से बंद न करें, बल्कि "HOLD" का निर्णय दें जब तक कि दिशा बदलने की आवश्यकता न हो।
-
-काम: लाइव मार्केट डेटा और ओपन पोजीशन का विश्लेषण करके अपना निर्णय केवल और केवल एक वैध JSON फॉर्मेट में भेजें।
-
-JSON Format:
-{
-  "action": "BUY" या "SELL" या "HOLD",
-  "symbol": "BTC/USDT",
-  "quantity": 0.001,
-  "leverage": 1,
-  "stop_loss": 0.0,
-  "take_profit": 0.0,
-  "reason": "संक्षिप्त कारण"
-}
-"""
-
-# ==========================================
-# 5. 20% डेली स्टॉप-लॉस और बैलेंस चेकर (USDT)
-# ==========================================
-def check_daily_stop_loss():
-    global day_start_balance, last_reset_day, stop_loss_hit_today
-    current_day = datetime.now(timezone.utc).date()
-
-    if last_reset_day != current_day:
-        day_start_balance = None
-        last_reset_day = current_day
-        stop_loss_hit_today = False
-
-    if stop_loss_hit_today:
-        return True, 0.0
-
-    try:
-        balance_info = exchange.fetch_balance()
-        current_balance = float(balance_info.get('total', {}).get('USDT', 0.0))
-        
-        if current_balance <= 0:
-            current_balance = float(balance_info.get('free', {}).get('USDT', 10.0))
-
-        if day_start_balance is None:
-            day_start_balance = current_balance
-            log_and_alert(f"🌅 **New Trading Day Started**\nStarting Balance: {day_start_balance:.2f} USDT")
-
-        loss_amount = day_start_balance - current_balance
-        max_allowed_loss = day_start_balance * DAILY_MAX_LOSS_PERCENT
-
-        if loss_amount >= max_allowed_loss:
-            stop_loss_hit_today = True
-            alert_msg = f"🛑 **CRITICAL: 20% Daily Stop-Loss Hit!**\nDay Start: {day_start_balance:.2f} USDT\nCurrent: {current_balance:.2f} USDT\nHalting trading for the rest of the day."
-            log_and_alert(alert_msg)
-            return True, current_balance
-
-        return False, current_balance
-
-    except Exception as e:
-        err_msg = f"⚠️ **Balance Check Error:** {e}"
-        log_and_alert(err_msg)
-        return False, 0.0
-
-# ==========================================
-# 6. मार्केट डेटा और ओपन पोजीशन फेच करना
-# ==========================================
-def fetch_market_and_position_data(symbol='BTC/USDT'):
-    try:
-        ticker = exchange.fetch_ticker(symbol)
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=36)
-        
-        open_positions = []
+def send_telegram(msg):
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         try:
-            positions = exchange.fetch_positions([symbol])
-            if positions:
-                for p in positions:
-                    if float(p.get('contracts', 0)) > 0:
-                        open_positions.append(p)
-        except Exception as pos_err:
-            print(f"Position fetch warning: {pos_err}")
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+        except Exception as e:
+            print(f"Telegram Error: {e}")
 
-        return {
-            "ticker": ticker, 
-            "ohlcv": ohlcv,
-            "open_positions": open_positions
-        }
+def get_signature(body):
+    secret_bytes = bytes(API_SECRET, encoding='utf-8')
+    body_string = json.dumps(body, separators=(',', ':'))
+    return hmac.new(secret_bytes, body_string.encode('utf-8'), hashlib.sha256).hexdigest()
+
+def get_market_data():
+    try:
+        url = f"{BASE_URL}/exchange/ticker"
+        res = requests.get(url, timeout=10)
+        return res.json()
     except Exception as e:
-        err_msg = f"⚠️ **Market Data Fetch Error:** {e}"
-        log_and_alert(err_msg)
+        print(f"Market Data Fetch Error: {e}")
+        return []
+
+def execute_coindcx_trade(pair, side, quantity, leverage):
+    if PAPER_TRADING:
+        alert = f"🟢 [PAPER TRADING] Order Sim: {side.upper()} {pair} | Qty: {quantity} | Leverage: {leverage}x"
+        print(alert)
+        send_telegram(alert)
+        return {"status": "paper_success"}
+
+    # Real Live Order Execution on CoinDCX Futures
+    url = f"{BASE_URL}/exchange/v1/derivatives/futures/orders/create"
+    body = {
+        "timestamp": int(time.time() * 1000),
+        "pair": pair,
+        "side": side,
+        "order_type": "market",
+        "total_quantity": float(quantity),
+        "leverage": int(leverage)
+    }
+    headers = {
+        'Content-Type': 'application/json',
+        'X-AUTH-APIKEY': API_KEY,
+        'X-AUTH-SIGNATURE': get_signature(body)
+    }
+    try:
+        res = requests.post(url, data=json.dumps(body, separators=(',', ':')), headers=headers, timeout=10)
+        res_data = res.json()
+        send_telegram(f"🚨 [REAL TRADE EXECUTED]: {res_data}")
+        return res_data
+    except Exception as e:
+        err = f"❌ Real Order Execution Failed: {e}"
+        print(err)
+        send_telegram(err)
         return None
 
-# ==========================================
-# 7. जेमिनी एआई से डिसीजन प्राप्त करना
-# ==========================================
-def get_ai_decision(market_data, current_balance):
-    prompt_payload = {
-        "current_balance_usdt": current_balance,
-        "market_data": market_data
-    }
-
-    prompt = f"""
-    {GEMINI_SYSTEM_INSTRUCTION}
-
-    वर्तमान लाइव बाज़ार, ओपन पोजीशन और पोर्टफोलियो डेटा:
-    {json.dumps(prompt_payload, default=str)}
-    """
-
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=prompt,
-            )
-            text = response.text.strip()
-            
-            match = re.search(r'\{.*\}', text, re.DOTALL)
-            if match:
-                return json.loads(match.group(0))
-            else:
-                raise ValueError("No valid JSON found in AI response.")
-        except Exception as e:
-            print(f"Attempt {attempt + 1} - Gemini Parsing Error: {e}")
-            if attempt == 2:
-                log_and_alert(f"⚠️ **Gemini API/Parsing Error after 3 attempts:** {e}")
-                return None
-            time.sleep(2)
-    return None
-
-# ==========================================
-# 8. ट्रेड निष्पादन (Real Execution)
-# ==========================================
-def execute_trade(decision):
-    if not decision or not isinstance(decision, dict):
-        log_and_alert("⚠️ **Invalid AI decision structure received.**")
-        return
-
-    action = decision.get("action", "HOLD").upper()
-    symbol = decision.get("symbol", "BTC/USDT")
-    raw_quantity = float(decision.get("quantity", 0.0))
-    ai_leverage = int(decision.get("leverage", 1))
-    stop_loss = float(decision.get("stop_loss", 0.0))
-    take_profit = float(decision.get("take_profit", 0.0))
-    reason = decision.get("reason", "No reason provided.")
-
-    if action not in ["BUY", "SELL"]:
-        log_and_alert(f"ℹ️ **AI Decision Status: {action}**\n- **Symbol:** {symbol}\n- **Reason:** {reason}")
-        return
-
+def ask_gemini_ai(market_tickers):
+    system_instruction = (
+        "You are an autonomous CoinDCX Crypto Futures trading bot. "
+        "Your constraints & rules: "
+        "1. Daily Max Loss Limit is strictly 20%. "
+        "2. Keep leverage as low as possible by default, but you are authorized to scale up to maximum leverage when market conviction is extremely high. "
+        "3. You have full autonomy to decide based on the live market data whether to BUY, SELL, or HOLD, including pair selection, quantity, leverage, and stop-loss logic. "
+        "Analyze the live market data and return strictly valid JSON only in this exact schema:\n"
+        "{\n"
+        '  "action": "BUY" | "SELL" | "HOLD",\n'
+        '  "pair": "string (e.g., B-BTC_USDT)",\n'
+        '  "quantity": number,\n'
+        '  "leverage": number,\n'
+        '  "reason": "short explanation"\n'
+        "}"
+    )
+    
+    prompt = f"System Rules:\n{system_instruction}\n\nLive Market Tickers:\n{json.dumps(market_tickers[:15])}"
+    
     try:
-        quantity = float(exchange.amount_to_precision(symbol, raw_quantity))
-        formatted_sl = float(exchange.price_to_precision(symbol, stop_loss)) if stop_loss > 0 else 0.0
-        formatted_tp = float(exchange.price_to_precision(symbol, take_profit)) if take_profit > 0 else 0.0
+        response = model.generate_content(prompt)
+        decision = json.loads(response.text)
+        return decision
     except Exception as e:
-        log_and_alert(f"⚠️ **Precision Formatting Error:** {e}")
-        return
+        print(f"Gemini Decision Error: {e}")
+        return {"action": "HOLD", "reason": "AI Error"}
 
-    msg = f"""🤖 **AI Trading Decision Executed**
-- **Action:** {action}
-- **Symbol:** {symbol}
-- **Quantity:** {quantity}
-- **Leverage:** {ai_leverage}x
-- **Stop Loss:** {formatted_sl} USDT
-- **Target:** {formatted_tp} USDT
-- **Reason:** {reason}
-- **Mode:** {'⚡ REAL LIVE MONEY' if not PAPER_TRADING else 'PAPER TRADING'}"""
-
-    log_and_alert(msg)
-
-    if PAPER_TRADING:
-        log_and_alert(f"🧪 [PAPER TRADING] Simulated {action} trade logged for {symbol}.")
-        return
-
-    try:
-        try:
-            exchange.set_leverage(ai_leverage, symbol)
-        except Exception as lev_err:
-            log_and_alert(f"⚠️ Leverage Set Warning: {lev_err}")
-
-        if action == "BUY":
-            order = exchange.create_market_buy_order(symbol, quantity)
-            log_and_alert(f"✅ **Live BUY Order Placed Successfully!**\n`{json.dumps(order, default=str)}`")
-        elif action == "SELL":
-            order = exchange.create_market_sell_order(symbol, quantity)
-            log_and_alert(f"✅ **Live SELL Order Placed Successfully!**\n`{json.dumps(order, default=str)}`")
-    except Exception as e:
-        log_and_alert(f"❌ **Live Order Execution Error:** {str(e)}")
-
-# ==========================================
-# 9. मुख्य लूप (5-मिनट कैंडल सिंक्रोनाइजेशन)
-# ==========================================
-def wait_for_next_5m_candle():
-    now = datetime.now(timezone.utc)
-    seconds_into_hour = now.minute * 60 + now.second
-    next_boundary = ((seconds_into_hour // 300) + 1) * 300
-    sleep_seconds = next_boundary - seconds_into_hour + 3
-    time.sleep(sleep_seconds)
-
-def main():
-    log_and_alert("🚀 **Fully Synchronized Real Money AI Trading Bot Started!**")
-
-    symbol = 'BTC/USDT'
-
-    try:
-        exchange.load_markets()
-    except Exception as e:
-        log_and_alert(f"⚠️ Market load warning: {e}")
+if __name__ == "__main__":
+    mode_str = "PAPER TRADING (DEMO)" if PAPER_TRADING else "REAL MONEY LIVE TRADING"
+    start_msg = f"🚀 Bot Started on Render Cloud Server!\nMode: {mode_str}"
+    print(start_msg)
+    send_telegram(start_msg)
 
     while True:
         try:
-            stop_hit, current_balance = check_daily_stop_loss()
-            if stop_hit:
-                log_and_alert("🛑 **Daily 20% Stop Loss hit.** Trading halted. Checking again in 30 minutes...")
-                time.sleep(1800)
-                continue
+            # 1. Fetch Live Market Tickers
+            tickers = get_market_data()
+            
+            # 2. Get AI Autonomous Decision
+            ai = ask_gemini_ai(tickers)
+            print(f"AI Decision: {ai}")
 
-            market_data = fetch_market_and_position_data(symbol)
-            if market_data:
-                decision = get_ai_decision(market_data, current_balance)
-                if decision:
-                    execute_trade(decision)
+            # 3. Execute Trade based on Gemini Output
+            action = ai.get("action", "HOLD").upper()
+            if action in ["BUY", "SELL"]:
+                execute_coindcx_trade(
+                    pair=ai.get("pair"),
+                    side=action.lower(),
+                    quantity=ai.get("quantity", 0.001),
+                    leverage=ai.get("leverage", 1)
+                )
+            else:
+                print(f"Holding/No Action: {ai.get('reason')}")
 
         except Exception as e:
-            log_and_alert(f"⚠️ **Main Loop Critical Error:** {e}")
+            err = f"Loop Error: {e}"
+            print(err)
+            send_telegram(err)
 
-        wait_for_next_5m_candle()
-
-if __name__ == "__main__":
-    bot_thread = Thread(target=main)
-    bot_thread.daemon = True
-    bot_thread.start()
-
-    run_web_server()
+        # Runs every 5 minutes (300 seconds)
+        time.sleep(300)
