@@ -3,8 +3,12 @@ import time
 import hmac
 import hashlib
 import json
+import threading
 import requests
 import google.generativeai as genai
+from flask import Flask
+
+app = Flask(__name__)
 
 # Environment Variables Setup
 API_KEY = os.getenv('COINDCX_API_KEY')
@@ -24,6 +28,10 @@ model = genai.GenerativeModel(
     model_name='gemini-2.0-flash',
     generation_config={"response_mime_type": "application/json"}
 )
+
+@app.route('/')
+def home():
+    return "CoinDCX Trading Bot Web Service is Running Live!"
 
 def send_telegram(msg):
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
@@ -54,7 +62,6 @@ def execute_coindcx_trade(pair, side, quantity, leverage):
         send_telegram(alert)
         return {"status": "paper_success"}
 
-    # Real Live Order Execution on CoinDCX Futures
     url = f"{BASE_URL}/exchange/v1/derivatives/futures/orders/create"
     body = {
         "timestamp": int(time.time() * 1000),
@@ -83,11 +90,11 @@ def execute_coindcx_trade(pair, side, quantity, leverage):
 def ask_gemini_ai(market_tickers):
     system_instruction = (
         "You are an autonomous CoinDCX Crypto Futures trading bot. "
-        "Your constraints & rules: "
-        "1. Daily Max Loss Limit is strictly 20%. "
-        "2. Keep leverage as low as possible by default, but you are authorized to scale up to maximum leverage when market conviction is extremely high. "
-        "3. You have full autonomy to decide based on the live market data whether to BUY, SELL, or HOLD, including pair selection, quantity, leverage, and stop-loss logic. "
-        "Analyze the live market data and return strictly valid JSON only in this exact schema:\n"
+        "Your core rules: "
+        "1. Daily stop loss is strictly 20%. "
+        "2. Keep leverage as low as possible by default, but you are free to use maximum or as much leverage as needed when required. "
+        "Analyze the live market data and have full autonomy to decide whether to BUY, SELL, or HOLD, along with the coin pair, quantity, and leverage. "
+        "Return strictly valid JSON only in this exact schema:\n"
         "{\n"
         '  "action": "BUY" | "SELL" | "HOLD",\n'
         '  "pair": "string (e.g., B-BTC_USDT)",\n'
@@ -107,22 +114,17 @@ def ask_gemini_ai(market_tickers):
         print(f"Gemini Decision Error: {e}")
         return {"action": "HOLD", "reason": "AI Error"}
 
-if __name__ == "__main__":
-    mode_str = "PAPER TRADING (DEMO)" if PAPER_TRADING else "REAL MONEY LIVE TRADING"
-    start_msg = f"🚀 Bot Started on Render Cloud Server!\nMode: {mode_str}"
+def trading_bot_loop():
+    start_msg = f"🚀 Bot Started as Web Service on Render!\nMode: {'PAPER TRADING' if PAPER_TRADING else 'REAL MONEY'}"
     print(start_msg)
     send_telegram(start_msg)
 
     while True:
         try:
-            # 1. Fetch Live Market Tickers
             tickers = get_market_data()
-            
-            # 2. Get AI Autonomous Decision
             ai = ask_gemini_ai(tickers)
             print(f"AI Decision: {ai}")
 
-            # 3. Execute Trade based on Gemini Output
             action = ai.get("action", "HOLD").upper()
             if action in ["BUY", "SELL"]:
                 execute_coindcx_trade(
@@ -139,5 +141,13 @@ if __name__ == "__main__":
             print(err)
             send_telegram(err)
 
-        # Runs every 5 minutes (300 seconds)
         time.sleep(300)
+
+if __name__ == "__main__":
+    # Start trading loop in a background thread so the web server can respond to port checks
+    t = threading.Thread(target=trading_bot_loop, daemon=True)
+    t.start()
+
+    # Run Flask web server on Render's assigned port
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
