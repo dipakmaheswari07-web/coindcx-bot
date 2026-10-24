@@ -3,247 +3,238 @@ import time
 import hmac
 import hashlib
 import json
-import threading
 import requests
-import google.generativeai as genai
+import datetime
+import threading
 from flask import Flask
+import google.generativeai as genai
+from telegram import Bot
 
+# ==========================================
+# 1. Flask Web Server Setup (Render के लिए जरूरी)
+# ==========================================
 app = Flask(__name__)
-
-# Environment Variables Setup
-API_KEY = os.getenv('COINDCX_API_KEY')
-API_SECRET = os.getenv('COINDCX_API_SECRET')
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-
-PAPER_TRADING = os.getenv('PAPER_TRADING', 'true').lower() == 'true'
-BASE_URL = "https://api.coindcx.com"
-
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel(
-    model_name='gemini-2.0-flash',
-    generation_config={"response_mime_type": "application/json"}
-)
 
 @app.route('/')
 def home():
-    return "CoinDCX Trading Bot with Advanced PnL & Candle-Start Retry Safety is Running Live!"
+    return "🤖 Gemini AI Autonomous Trading Bot is Live and Running!"
 
-def send_telegram(msg):
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+@app.route('/health')
+def health_check():
+    return "OK", 200
+
+# ==========================================
+# 2. Environment Variables & Setup
+# ==========================================
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+COINDCX_API_KEY = os.environ.get("COINDCX_API_KEY")
+COINDCX_SECRET_KEY = os.environ.get("COINDCX_SECRET_KEY")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+# Gemini API सेटअप
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+
+# Telegram Bot Setup
+tg_bot = Bot(token=TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
+
+def send_telegram(message):
+    """Telegram पर संदेश भेजने का फ़ंक्शन"""
+    if tg_bot and TELEGRAM_CHAT_ID:
         try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+            tg_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
         except Exception as e:
-            print(f"Telegram Error: {e}")
+            print(f"Telegram भेजते समय त्रुटि: {e}")
 
-def get_signature(body):
-    secret_bytes = bytes(API_SECRET, encoding='utf-8')
-    body_string = json.dumps(body, separators=(',', ':'))
-    return hmac.new(secret_bytes, body_string.encode('utf-8'), hashlib.sha256).hexdigest()
+# ==========================================
+# 3. CoinDCX Helper Functions
+# ==========================================
+BASE_URL = "https://api.coindcx.com"
 
-def get_market_data():
-    try:
-        url = f"{BASE_URL}/exchange/ticker"
-        res = requests.get(url, timeout=10)
-        return res.json()
-    except Exception as e:
-        print(f"Market Data Fetch Error: {e}")
-        return []
+def get_coindcx_signature(payload_bytes):
+    return hmac.new(
+        COINDCX_SECRET_KEY.encode('utf-8'),
+        payload_bytes,
+        hashlib.sha256
+    ).hexdigest()
 
-def get_active_positions():
-    if PAPER_TRADING:
-        return []
+def get_account_balance():
+    """CoinDCX Wallet Balance निकालता है"""
+    url = f"{BASE_URL}/exchange/v1/users/balances"
+    timeStamp = int(round(time.time() * 1000))
+    body = {"timestamp": timeStamp}
+    json_body = json.dumps(body, separators=(',', ':'))
     
-    url = f"{BASE_URL}/exchange/v1/derivatives/futures/positions"
-    body = {"timestamp": int(time.time() * 1000)}
     headers = {
         'Content-Type': 'application/json',
-        'X-AUTH-APIKEY': API_KEY,
-        'X-AUTH-SIGNATURE': get_signature(body)
+        'X-AUTH-APIKEY': COINDCX_API_KEY,
+        'X-AUTH-SIGNATURE': get_coindcx_signature(json_body.encode('utf-8'))
     }
+    
     try:
-        res = requests.post(url, data=json.dumps(body, separators=(',', ':')), headers=headers, timeout=10)
+        response = requests.post(url, data=json_body, headers=headers)
+        if response.status_code == 200:
+            return response.json()
+    except Exception as e:
+        print(f"Balance fetch error: {e}")
+    return []
+
+def get_market_candles(market="B-BTC_INR"):
+    """हाल के कैंडलस्टिक डेटा प्राप्त करें"""
+    url = f"https://public.coindcx.com/market_data/candles?pair={market}&interval=1m&limit=30"
+    try:
+        res = requests.get(url)
+        if res.status_code == 200:
+            return res.json()
+    except Exception as e:
+        print(f"Candles fetch error: {e}")
+    return []
+
+def execute_coindcx_order(side, market, price, quantity):
+    """CoinDCX पर Order प्लेस करता है"""
+    url = f"{BASE_URL}/exchange/v1/orders/create"
+    timeStamp = int(round(time.time() * 1000))
+    
+    body = {
+        "side": side,  # "buy" या "sell"
+        "order_type": "market_order" if price == 0 else "limit_order",
+        "market": market,
+        "total_quantity": str(quantity),
+        "timestamp": timeStamp
+    }
+    if price > 0:
+        body["price_per_unit"] = str(price)
+        
+    json_body = json.dumps(body, separators=(',', ':'))
+    headers = {
+        'Content-Type': 'application/json',
+        'X-AUTH-APIKEY': COINDCX_API_KEY,
+        'X-AUTH-SIGNATURE': get_coindcx_signature(json_body.encode('utf-8'))
+    }
+    
+    try:
+        res = requests.post(url, data=json_body, headers=headers)
         return res.json()
     except Exception as e:
-        print(f"Fetch Positions Error: {e}")
-        return []
-
-def execute_coindcx_trade(pair, side, quantity, leverage, order_type="market"):
-    if PAPER_TRADING:
-        alert = f"🟢 [PAPER TRADING] Action: {side.upper()} | Pair: {pair} | Qty: {quantity} | Lev: {leverage}x"
-        print(alert)
-        send_telegram(alert)
-        return {"status": "paper_success"}
-
-    url = f"{BASE_URL}/exchange/v1/derivatives/futures/orders/create"
-    body = {
-        "timestamp": int(time.time() * 1000),
-        "pair": pair,
-        "side": side,
-        "order_type": order_type,
-        "total_quantity": float(quantity),
-        "leverage": int(leverage)
-    }
-    headers = {
-        'Content-Type': 'application/json',
-        'X-AUTH-APIKEY': API_KEY,
-        'X-AUTH-SIGNATURE': get_signature(body)
-    }
-    try:
-        res = requests.post(url, data=json.dumps(body, separators=(',', ':')), headers=headers, timeout=10)
-        res_data = res.json()
-        send_telegram(f"🚨 [REAL TRADE EXECUTED]: {res_data}")
-        return res_data
-    except Exception as e:
-        err = f"❌ Order Execution Failed: {e}"
-        print(err)
-        send_telegram(err)
+        print(f"Order error: {e}")
         return None
 
-def ask_gemini_ai(market_tickers, active_positions):
-    system_instruction = (
-        "You are an autonomous CoinDCX Crypto Futures trading bot. "
-        "Your core rules: "
-        "1. Daily stop loss is strictly 20%. "
-        "2. Keep leverage as low as possible by default, but use maximum when required. "
-        "3. If there is an active/open position and market conditions turn against it, output 'CLOSE' to exit early. "
-        "4. If no position is open, decide 'BUY', 'SELL', or 'HOLD'. "
-        "Return strictly valid JSON only in this exact schema:\n"
-        "{\n"
-        '  "action": "BUY" | "SELL" | "CLOSE" | "HOLD",\n'
-        '  "pair": "string (e.g., B-BTC_USDT)",\n'
-        '  "quantity": number,\n'
-        '  "leverage": number,\n'
-        '  "reason": "short explanation"\n'
-        "}"
-    )
-    
-    prompt = f"System Rules:\n{system_instruction}\n\nCurrently Active Positions:\n{json.dumps(active_positions)}\n\nLive Market Tickers:\n{json.dumps(market_tickers[:15])}"
-    
+# ==========================================
+# 4. Gemini AI Autonomous Decision Engine
+# ==========================================
+def get_gemini_autonomous_decision(market_data, balances):
+    prompt = f"""
+आप एक पूरी तरह से स्वतंत्र और कुशल क्रिप्टो एल्गो-ट्रेडर AI हैं। आपको मार्केट की हर स्थिति पर पूर्ण निर्णय (Full Autonomy) लेने की अनुमति है।
+आपके पास निम्नलिखित डेटा उपलब्ध है:
+1. मार्केट कैंडलस्टिक डेटा (OHLCV): {json.dumps(market_data)}
+2. वर्तमान वॉलेट बैलेंस: {json.dumps(balances)}
+
+आपको निम्नलिखित में से **केवल एक** JSON फॉर्मेट में सटीक निर्णय देना है:
+- निर्णय प्रकार (`decision`): "BUY", "SELL", "HOLD", या "CLOSE_POSITION"
+- कारण (`reason`): आपके फैसले के पीछे तकनीकी और रणनीतिक कारण।
+- सुझाए गए मूल्य (`suggested_price`): यदि लिमिट ऑर्डर है तो कीमत, अन्यथा 0।
+- मात्रा अनुपात (`quantity_ratio`): उपलब्ध बैलेंस का कितना हिस्सा उपयोग करना है (जैसे 0.1 यानी 10%)।
+
+कृपया केवल इस JSON प्रारूप में उत्तर दें, बिना किसी अतिरिक्त टेक्स्ट या मार्कडाउन के:
+{{
+    "decision": "HOLD",
+    "reason": "यहाँ कारण लिखें",
+    "suggested_price": 0.0,
+    "quantity_ratio": 0.1
+}}
+"""
     try:
-        response = model.generate_content(prompt)
-        decision = json.loads(response.text)
-        return decision
+        response = gemini_model.generate_content(prompt)
+        cleaned_text = response.text.replace("```json", "").replace("```", "").strip()
+        decision_data = json.loads(cleaned_text)
+        return decision_data
     except Exception as e:
-        print(f"Gemini Decision Error: {e}")
-        return {"action": "HOLD", "reason": "AI Error"}
+        print(f"Gemini AI decision error: {e}")
+        return {"decision": "HOLD", "reason": f"AI Parsing Error: {e}", "suggested_price": 0.0, "quantity_ratio": 0.0}
 
-def trading_bot_loop():
-    start_msg = f"🚀 Bot Started with Advanced PnL & Start Retry Safety on Render!\nMode: {'PAPER TRADING' if PAPER_TRADING else 'REAL MONEY'}"
-    print(start_msg)
-    send_telegram(start_msg)
-
-    consecutive_start_failures = 0
-
+# ==========================================
+# 5. Background Trading Loop + 20% Stop-Loss
+# ==========================================
+def run_trading_bot():
+    """यह फ़ंक्शन बैकग्राउंड में लगातार ट्रेड लूप चलाएगा"""
+    time.sleep(10) # सर्वर पूरी तरह उठने का इंतज़ार
+    send_telegram("🤖 **Web Server Mode:** Fully Autonomous Gemini AI Bot सक्रिय हो गया है!")
+    
+    current_day = datetime.datetime.now().day
+    start_day_balance = None
+    TARGET_MARKET = "B-BTC_INR"
+    
     while True:
         try:
-            # 1. 5-min candle sync and 5-sec buffer
-            now = time.time()
-            interval = 300
-            remainder = now % interval
-            sleep_to_5s = interval - remainder + 5
-            if sleep_to_5s > interval:
-                sleep_to_5s -= interval
-            time.sleep(sleep_to_5s)
-
-            # 2. First 14 seconds check at candle start
-            tickers = []
-            for attempt in range(1, 11):
-                tickers = get_market_data()
-                if tickers and len(tickers) > 0:
-                    break
-                time.sleep(1)
-
-            initial_14s_success = bool(tickers and len(tickers) > 0)
-
-            # 3. If first 14s failed, extend retry up to 1 minute (60s total)
-            if not initial_14s_success:
-                consecutive_start_failures += 1
-                warn_msg = f"⚠️ Warning: Data not received in first 14s. Consecutive start failures: {consecutive_start_failures}. Extending retry for up to 1 minute..."
-                print(warn_msg)
-                send_telegram(warn_msg)
-
-                for extended_attempt in range(1, 47):
-                    tickers = get_market_data()
-                    if tickers and len(tickers) > 0:
-                        print(f"Data received during extended retry at attempt {extended_attempt}")
-                        break
-                    time.sleep(1)
-
-            # 4. If no data received even after 1 full minute
-            if not tickers:
-                error_alert = "🚨 [CRITICAL EXTREME ALERT] No market data received for 1 full minute from candle start!"
-                print(error_alert)
-                send_telegram(error_alert)
-
-                positions = get_active_positions()
-                if positions and len(positions) > 0:
-                    close_msg = "🚨 [SAFETY AUTO-CLOSE] Data unavailable for 1 full minute. Closing open position!"
-                    print(close_msg)
-                    send_telegram(close_msg)
-                    ai = {"action": "CLOSE", "reason": "No data received for 1 minute safety close"}
-                else:
-                    ai = {"action": "HOLD", "reason": "No data received, no open position"}
-            else:
-                if initial_14s_success:
-                    consecutive_start_failures = 0  # कैंडल की शुरुआत में 14 सेकंड में डेटा मिलने पर काउंटर रीसेट
-
-                positions = get_active_positions()
-                
-                # Check Profit or Loss state from active positions
-                in_loss = False
-                if positions and len(positions) > 0:
-                    for pos in positions:
-                        pnl = float(pos.get('pnl', pos.get('unrealized_pnl', 0.0)))
-                        if pnl < 0:
-                            in_loss = True
-                            break
-
-                # Apply consecutive candle-start failure rules with PnL condition
-                if not initial_14s_success and positions and len(positions) > 0:
-                    if in_loss and consecutive_start_failures >= 3:
-                        close_msg = f"🚨 [EXTREME ALERT & AUTO-CLOSE] 3rd consecutive candle start failure while position is in LOSS! Closing position."
-                        print(close_msg)
-                        send_telegram(close_msg)
-                        ai = {"action": "CLOSE", "reason": "3rd candle start failure in loss"}
-                    elif not in_loss and consecutive_start_failures >= 4:
-                        close_msg = f"🚨 [EXTREME ALERT & AUTO-CLOSE] 4th consecutive candle start failure while position is in PROFIT! Closing position."
-                        print(close_msg)
-                        send_telegram(close_msg)
-                        ai = {"action": "CLOSE", "reason": "4th candle start failure in profit"}
-                    else:
-                        ai = ask_gemini_ai(tickers, positions)
-                else:
-                    ai = ask_gemini_ai(tickers, positions)
+            now = datetime.datetime.now()
             
-            print(f"AI Decision: {ai}")
+            balances = get_account_balance()
+            inr_bal = next((float(b['balance']) for b in balances if b['currency'] == 'INR'), 0.0) if balances else 0.0
+            
+            if start_day_balance is None or now.day != current_day:
+                current_day = now.day
+                start_day_balance = inr_bal
+                send_telegram(f"🌅 **नया दिन शुरू!** आज का शुरुआती बैलेंस: ₹{start_day_balance}")
 
-            # 5. Execute Action
-            action = ai.get("action", "HOLD").upper()
-            pair = ai.get("pair")
-            quantity = ai.get("quantity", 0.001)
-            leverage = ai.get("leverage", 1)
+            # 1. 20% डेली स्टॉप-लॉस चेक
+            if start_day_balance > 0:
+                loss_percentage = ((start_day_balance - inr_bal) / start_day_balance) * 100
+                if loss_percentage >= 20.0:
+                    msg = f"🛑 **DAILY STOP-LOSS HIT (20%)!**\nआज का नुकसान 20% तक पहुँच चुका है ({loss_percentage:.2f}%)। सुरक्षा के लिए बोट आज ट्रेडिंग बंद कर रहा है।"
+                    send_telegram(msg)
+                    time.sleep(3600 * 6)  # 6 घंटे विश्राम
+                    continue
 
-            if action == "BUY":
-                execute_coindcx_trade(pair, "buy", quantity, leverage)
-            elif action == "SELL":
-                execute_coindcx_trade(pair, "sell", quantity, leverage)
-            elif action == "CLOSE":
-                send_telegram(f"🚨 [CLOSING POSITION] Reason: {ai.get('reason')}")
-            else:
-                print(f"Holding: {ai.get('reason')}")
+            # 2. मार्केट डेटा इकट्ठा करें
+            candles = get_market_candles(TARGET_MARKET)
+            if not candles:
+                time.sleep(60)
+                continue
+
+            # 3. Gemini से स्वतंत्र निर्णय लें
+            ai_res = get_gemini_autonomous_decision(candles, balances)
+            decision = ai_res.get("decision")
+            reason = ai_res.get("reason")
+            price = ai_res.get("suggested_price", 0.0)
+            ratio = ai_res.get("quantity_ratio", 0.1)
+
+            print(f"AI Decision: {decision} | Reason: {reason}")
+
+            # 4. निर्णय के आधार पर एक्शन लें
+            if decision in ["BUY", "SELL"]:
+                available_inr = inr_bal * ratio
+                current_price = candles[-1][4] if candles else 5000000 
+                quantity = round(available_inr / float(current_price), 6)
+                
+                if quantity > 0:
+                    order_res = execute_coindcx_order(decision.lower(), TARGET_MARKET, price, quantity)
+                    log_msg = f"⚡ **AI Trade Executed**\n*Action:* {decision}\n*Market:* {TARGET_MARKET}\n*Reason:* {reason}\n*Response:* `{order_res}`"
+                    send_telegram(log_msg)
+                else:
+                    send_telegram(f"⚠️ AI ने {decision} चाहा, लेकिन पर्याप्त बैलेंस उपलब्ध नहीं है।")
+
+            elif decision == "CLOSE_POSITION":
+                send_telegram(f"🔄 **AI Action: CLOSE POSITION**\n*Reason:* {reason}\nसभी खुली पोजीशन को रीसेट किया जा रहा है।")
+
+            elif decision == "HOLD":
+                print(f"AI Holding... Reason: {reason}")
+
+            time.sleep(180)
 
         except Exception as e:
-            err = f"Loop Error: {e}"
-            print(err)
-            send_telegram(err)
-            time.sleep(10)
+            print(f"Main Loop Error: {e}")
+            time.sleep(60)
 
+# ==========================================
+# 6. Server Entry Point
+# ==========================================
 if __name__ == "__main__":
-    t = threading.Thread(target=trading_bot_loop, daemon=True)
-    t.start()
+    # ट्रेडिंग बोट को बैकग्राउंड थ्रेड में शुरू करें
+    bot_thread = threading.Thread(target=run_trading_bot, daemon=True)
+    bot_thread.start()
 
+    # Render द्वारा दिए गए पोर्ट या डिफॉल्ट 10000 पर Flask वेब सर्वर चलाएं
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
