@@ -4,7 +4,30 @@ import requests
 import hmac
 import hashlib
 import json
+import threading
+import http.server
+import socketserver
 import google.generativeai as genai
+
+# ==========================================
+# 0. RENDER PORT BINDING FIX (WEB SERVER)
+# ==========================================
+PORT = int(os.environ.get("PORT", 10000))
+
+class HealthCheckHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Trading Bot is alive and running!")
+
+def run_web_server():
+    with socketserver.TCPServer(("", PORT), HealthCheckHandler) as httpd:
+        print(f"Health check server started on port {PORT}")
+        httpd.serve_forever()
+
+# Start the web server in a background thread so Render port check passes
+server_thread = threading.Thread(target=run_web_server, daemon=True)
+server_thread.start()
 
 # ==========================================
 # 1. RENDER ENVIRONMENT VARIABLES
