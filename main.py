@@ -1,7 +1,7 @@
 import os
 import time
 import requests
-from google import genai
+import google.generativeai as genai
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 
@@ -13,10 +13,10 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 PAPER_TRADING = os.environ.get("PAPER_TRADING", "True").lower() == "true"
 
-# नए google.genai पैकेज का उपयोग करके क्लाइंट सेटअप
-client = None
+# जेमिनी मॉडल सेटअप
 if GEMINI_API_KEY:
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-1.5-flash")
 
 # रेंडर हेल्थ चेक के लिए इन-बिल्ट एचटीटीपी सर्वर
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -72,20 +72,14 @@ def analyze_and_trade():
     prompt_input = f"{system_prompt}\n\nLive Market Data:\n{market_data}\n\nAnalyze the data and provide your optimal trading decisions."
     
     try:
-        if client:
-            response = client.models.generate_content(
-                model='gemini-3.8-flash',
-                contents=prompt_input
-            )
-            ai_decision = response.text
-            print(f"AI Decision: {ai_decision}")
-            
-            if PAPER_TRADING:
-                send_telegram(f"🤖 **पेपर ट्रेडिंग लाइव अपडेट**\n\n{ai_decision}")
-            else:
-                send_telegram(f"🚀 **लाइव ट्रेड सिग्नल**\n\n{ai_decision}")
+        response = model.generate_content(prompt_input)
+        ai_decision = response.text
+        print(f"AI Decision: {ai_decision}")
+        
+        if PAPER_TRADING:
+            send_telegram(f"🤖 **पेपर ट्रेडिंग लाइव अपडेट**\n\n{ai_decision}")
         else:
-            print("Gemini API Key missing.")
+            send_telegram(f"🚀 **लाइव ट्रेड सिग्नल**\n\n{ai_decision}")
             
     except Exception as e:
         print(f"एआई विश्लेषण त्रुटि: {e}")
