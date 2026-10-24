@@ -16,7 +16,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "🚀 Crypto AI Trading Bot is Running Live!"
+    return "🚀 Live Crypto AI Trading Bot is Running!"
 
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
@@ -31,6 +31,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+# ⚠️ रियल मनी मोड के लिए इसे False रखा गया है
 PAPER_TRADING = os.getenv("PAPER_TRADING", "False").lower() == "true"
 DAILY_MAX_LOSS_PERCENT = 0.20  # 20% दैनिक स्टॉप-लॉस
 
@@ -41,11 +42,11 @@ if not COINDCX_API_KEY or not COINDCX_SECRET_KEY:
     raise ValueError("CoinDCX API Keys are missing!")
 
 # ==========================================
-# 2. क्लाइंट और एक्सचेंज सेटअप (CCXT & Gemini)
+# 2. क्लाइंट और एक्सचेंज सेटअप (CoinDCX Futures)
 # ==========================================
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-exchange = ccxt['coindcx']({
+exchange = ccxt.coindcx({
     'apiKey': COINDCX_API_KEY,
     'secret': COINDCX_SECRET_KEY,
     'enableRateLimit': True,
@@ -77,13 +78,13 @@ def log_and_alert(message):
     send_telegram_alert(message)
 
 # ==========================================
-# 4. जेमिनी एआई का सिस्टम इंस्ट्रक्शन
+# 4. जेमिनी एआई का सिस्टम इंस्ट्रक्शन (3 मुख्य नियम)
 # ==========================================
 GEMINI_SYSTEM_INSTRUCTION = """
 नियम: 
-1. फुल डे का स्टॉप-लॉस 20% है।
-2. लेवरेज का चयन: हमेशा कम से कम (लो से लो, जैसे 1x) लेवरेज रखने की कोशिश करें, लेकिन जरूरत पड़ने पर अधिकतम (Maximum) लेवरेज तक ले सकते हैं।
-3. आपके पास पोर्टफोलियो का बैलेंस, 5-मिनट की कैंडलें और वर्तमान ओपन पोजीशन (Open Position) का डेटा होगा। उसके आधार पर ही सही निर्णय लें। अगर कोई पोजीशन पहले से लाइव है और टारगेट की तरफ सही दिशा में बढ़ रही है, तो अनावश्यक बंद न करें, बल्कि "HOLD" का निर्णय दें जब तक कि दिशा बदलने की आवश्यकता न हो।
+1. फुल डे का स्टॉप-लॉस 20% है। यदि दिन की शुरुआत के बैलेंस से 20% नुकसान हो जाए, तो ट्रेडिंग बंद कर देनी है।
+2. लेवरेज का चयन: हमेशा कम से कम (लो से लो, जैसे 1x) लेवरेज रखने की कोशिश करें, लेकिन जरूरत पड़ने पर अधिकतम लेवरेज ले सकते हैं।
+3. ओपन पोजीशन अवेयरनेस: आपके पास पोर्टफोलियो का बैलेंस, 5-मिनट की कैंडलें और वर्तमान ओपन पोजीशन का डेटा होगा। यदि कोई पोजीशन पहले से लाइव है और टारगेट की दिशा में सही चल रही है, तो उसे अनावश्यक रूप से बंद न करें, बल्कि "HOLD" का निर्णय दें जब तक कि दिशा बदलने की आवश्यकता न हो।
 
 काम: लाइव मार्केट डेटा और ओपन पोजीशन का विश्लेषण करके अपना निर्णय केवल और केवल एक वैध JSON फॉर्मेट में भेजें।
 
@@ -207,7 +208,7 @@ def get_ai_decision(market_data, current_balance):
     return None
 
 # ==========================================
-# 8. ट्रेड निष्पादन
+# 8. ट्रेड निष्पादन (Real Execution)
 # ==========================================
 def execute_trade(decision):
     if not decision or not isinstance(decision, dict):
@@ -242,7 +243,7 @@ def execute_trade(decision):
 - **Stop Loss:** {formatted_sl} USDT
 - **Target:** {formatted_tp} USDT
 - **Reason:** {reason}
-- **Mode:** {'PAPER TRADING' if PAPER_TRADING else '⚡ REAL LIVE MONEY'}"""
+- **Mode:** {'⚡ REAL LIVE MONEY' if not PAPER_TRADING else 'PAPER TRADING'}"""
 
     log_and_alert(msg)
 
@@ -266,7 +267,7 @@ def execute_trade(decision):
         log_and_alert(f"❌ **Live Order Execution Error:** {str(e)}")
 
 # ==========================================
-# 9. मुख्य लूप (5-मिनट सिंक्रोनाइजेशन)
+# 9. मुख्य लूप (5-मिनट कैंडल सिंक्रोनाइजेशन)
 # ==========================================
 def wait_for_next_5m_candle():
     now = datetime.now(timezone.utc)
@@ -276,7 +277,7 @@ def wait_for_next_5m_candle():
     time.sleep(sleep_seconds)
 
 def main():
-    log_and_alert("🚀 **Fully Synchronized & Tracked Crypto Futures Trading Bot Started!**")
+    log_and_alert("🚀 **Fully Synchronized Real Money AI Trading Bot Started!**")
 
     symbol = 'BTC/USDT'
 
