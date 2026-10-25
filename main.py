@@ -6,7 +6,7 @@ import json
 import threading
 import datetime
 import requests
-import google.generativeai as genai
+from google import genai
 from flask import Flask, jsonify
 
 app = Flask(__name__)
@@ -21,10 +21,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 PAPER_TRADING = os.getenv("PAPER_TRADING", "True").lower() == "true"
 
-# Gemini AI Initialization
-genai.configure(api_key=GEMINI_API_KEY)
+# Modern Google GenAI Client Initialization
+client = genai.Client(api_key=GEMINI_API_KEY)
 ACTIVE_MODEL_NAME = 'gemini-2.5-flash'
-model = genai.GenerativeModel(ACTIVE_MODEL_NAME)
 
 BASE_URL = "https://api.coindcx.com"
 
@@ -134,8 +133,7 @@ def get_open_positions():
     return []
 
 def check_daily_stop_loss(current_balance):
-    # Robust UTC/Server Date sync for Rule 1 (20% Daily Master Stop Loss)
-    today_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+    today_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
     with state_lock:
         if bot_memory["last_reset_date"] != today_str:
             bot_memory["initial_daily_balance"] = current_balance
@@ -164,7 +162,6 @@ def calculate_precise_quantity(pair, raw_quantity):
 def execute_trade_action(pair, action, quantity, leverage, entry_price, order_tag="MAJOR"):
     mode_label = "PAPER TRADING" if PAPER_TRADING else "REAL MONEY TRADING 🔴"
     
-    # Rule 1 Internal Logic: Hard Stop-Loss calculation (20% margin risk protection)
     if action == "BUY":
         hard_sl_price = round(entry_price * (1 - (0.20 / leverage)), 2)
     elif action == "SELL":
@@ -258,7 +255,7 @@ def trading_loop():
         try:
             with state_lock:
                 bot_memory["total_loops_executed"] += 1
-                bot_memory["last_execution_timestamp"] = str(datetime.datetime.utcnow())
+                bot_memory["last_execution_timestamp"] = str(datetime.datetime.now(datetime.timezone.utc))
 
             current_balance = get_wallet_balance()
             if current_balance is None:
@@ -280,7 +277,6 @@ def trading_loop():
 
             open_positions = get_open_positions()
 
-            # Fully comprehensive prompt empowering Gemini AI with absolute autonomy, while strictly locking core rules
             prompt = (
                 f"--- BOT ARCHITECTURE & TELEMETRY --- \n"
                 f"Running Environment: Flask Web Server with Self-Ping & Thread Safety. \n"
@@ -304,9 +300,11 @@ def trading_loop():
                 "\"leverage\" (integer between 1 and 100)."
             )
             
-            response = model.generate_content(
-                prompt,
-                generation_config={"response_mime_type": "application/json"}
+            # Modern Google GenAI API Call
+            response = client.models.generate_content(
+                model=ACTIVE_MODEL_NAME,
+                contents=prompt,
+                config={'response_mime_type': 'application/json'}
             )
             
             ai_data = None
@@ -373,13 +371,11 @@ def trading_loop():
                 time.sleep(60)
                 continue
 
-            # Rule 2 Internal Logic: Capital Allocation & Leverage Calculation
-            allocation_pct = 0.07 if pos_type == "PENNY" else 0.95  # 95% for Major within 92-97% range
+            allocation_pct = 0.07 if pos_type == "PENNY" else 0.95
             trade_usdt = (current_balance * allocation_pct) * leverage
             raw_quantity = trade_usdt / current_price
             quantity = calculate_precise_quantity(chosen_market, raw_quantity)
 
-            # Rule 3 Internal Logic: Autonomous Position Management
             if decision in ["BUY", "SELL"]:
                 latest_positions = get_open_positions()
                 if len(latest_positions) > 0 and not PAPER_TRADING:
